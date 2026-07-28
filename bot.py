@@ -469,6 +469,7 @@ async def browser_manager():
         # loop restarts: fresh launch_browser_stack() at top
 
 
+
 # ── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
 @router.message(lambda m: m.text == "⏸ Pause")
 async def cmd_pause(message: Message):
