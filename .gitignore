@@ -1,0 +1,8 @@
+.env
+bybit_session.json
+venv/
+__pycache__/
+*.pyc
+test.py
+ssh-key-2026-05-24 (1).key
+connect_login.py
