@@ -125,6 +125,10 @@ KEYBOARD = ReplyKeyboardMarkup(
             KeyboardButton(text="▶️ Resume"),
         ],
         [
+            KeyboardButton(text="🔵 Open Browser"), # Open browser 
+            KeyboardButton(text="🔴 Close Browser"),
+        ],
+        [
             KeyboardButton(text="📊 Status"),
         ],
     ],
@@ -488,6 +492,30 @@ async def cmd_pause(message: Message):
             "⏸ Already paused (no active session).",
             reply_markup=KEYBOARD
         )
+
+
+
+@router.message(lambda m: m.text == "🔴 Close Browser")
+async def cmd_close_browser(message: Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    await close_browser_stack()
+    await message.answer(
+        "🔴 Browser closed.",
+        reply_markup=KEYBOARD
+    )
+
+@router.message(lambda m: m.text == "🔵 Open Browser")
+async def cmd_open_browser(message: Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    await launch_browser_stack()
+    await message.answer(
+        "🔵 Browser opened.",
+        reply_markup=KEYBOARD
+    )
 
 
 @router.message(lambda m: m.text == "▶️ Resume")
