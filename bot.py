@@ -582,8 +582,8 @@ async def main():
 
     try:
         await asyncio.gather(
-            run_safe("BrowserManager", browser_manager),
             run_safe("TelegramBot", start_telegram),
+            run_safe("BrowserManager", browser_manager),
         )
     finally:
         log("[+] Shutting down. Closing browser...")
