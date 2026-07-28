@@ -506,6 +506,7 @@ async def cmd_close_browser(message: Message):
         reply_markup=KEYBOARD
     )
 
+
 @router.message(lambda m: m.text == "🔵 Open Browser")
 async def cmd_open_browser(message: Message):
     if message.chat.id != CHAT_ID:
