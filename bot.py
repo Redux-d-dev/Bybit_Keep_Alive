@@ -139,6 +139,7 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+
 async def notify(msg: str):
     try:
         await bot.send_message(
