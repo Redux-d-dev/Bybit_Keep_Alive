@@ -16,6 +16,17 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
+            set -euo pipefail
             cd /home/ademo/bybit-keepalive
-            git pull
+
+            echo "Before: $(git rev-parse HEAD)"
+
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            echo "After: $(git rev-parse HEAD)"
+
             sudo systemctl restart bybit-keepalive
+            sleep 2
+            sudo systemctl is-active --quiet bybit-keepalive && echo "Service is running" || (echo "Service failed to start" && exit 1)
