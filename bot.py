@@ -554,25 +554,24 @@ async def cmd_status(message: Message):
 async def start_telegram():
     dp = Dispatcher()
     dp.include_router(router)
-    log("[*] Telegram bot started.")
-    await dp.start_polling(bot)
 
-
-async def announce_boot():
     marker = Path(SCHEDULED_RESTART_MARKER)
 
     if marker.exists():
         marker.unlink()
         log("[i] Detected scheduled restart marker — quiet restart, no call.")
-        await send_telegram_raw("🔄 Bybit Keep-Alive scheduled restart completed.")
+        await notify("🔄 Bybit Keep-Alive scheduled restart completed.")
     else:
         log("[i] Genuine startup (no scheduled-restart marker) — sending call.")
-        await send_telegram_raw("🚀 Bybit Keep-Alive process starting up on VPS...")
+        await notify("🚀 Bybit Keep-Alive process starting up on VPS...")
         await alert_client.trigger_call(
             source="bybit-keepalive",
             error_signature="process_startup",
             message=f"Bybit Keep-Alive process just started on the VPS. Updated now {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         )
+
+    log("[*] Telegram bot started.")
+    await dp.start_polling(bot)
 
 
 async def main():
@@ -580,8 +579,6 @@ async def main():
     log("  Bybit P2P Keep-Alive")
     log(f"  Mode: {'VPS' if IS_ON_VPS else 'LOCAL'}")
     log("=" * 55)
-
-    await announce_boot()
 
     try:
         await asyncio.gather(
