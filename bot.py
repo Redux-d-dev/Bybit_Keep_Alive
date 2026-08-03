@@ -135,8 +135,7 @@ def get_keyboard() -> ReplyKeyboardMarkup:
     browser_label = "🔴 Close Browser" if state["browser_alive"] else "🟢 Open Browser"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=pause_label)],
-            [KeyboardButton(text=browser_label)],
+            [KeyboardButton(text=pause_label), KeyboardButton(text=browser_label)],
             [KeyboardButton(text="📊 Status")],
         ],
         resize_keyboard=True,
