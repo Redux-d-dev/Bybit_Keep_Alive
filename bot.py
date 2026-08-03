@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-IS_ON_VPS     = False    # Running on GCP VPS (africa-south1)
+IS_ON_VPS     = True    # Running on GCP VPS (africa-south1)
 
 COOKIES_FILE  = "bybit_session.json"
 BOT_STATE_FILE = "bybit_bot_state.json"   # persists user intent (running/browser_enabled) across restarts
@@ -124,6 +124,9 @@ browser_enabled = asyncio.Event()
 
 bot    = Bot(token=BOT_TOKEN)
 router = Router()
+dp = Dispatcher()
+dp.include_router(router)
+
 
 # ── KEYBOARD (built dynamically from state/memory on every render) ──────────
 def get_keyboard() -> ReplyKeyboardMarkup:
@@ -656,8 +659,6 @@ async def cmd_status(message: Message):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def start_telegram():
-    dp = Dispatcher()
-    dp.include_router(router)
 
     marker = Path(SCHEDULED_RESTART_MARKER)
 
