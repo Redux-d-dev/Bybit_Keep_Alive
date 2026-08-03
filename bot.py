@@ -17,6 +17,7 @@ load_dotenv()
 IS_ON_VPS     = False    # Running on GCP VPS (africa-south1)
 
 COOKIES_FILE  = "bybit_session.json"
+BOT_STATE_FILE = "bybit_bot_state.json"   # persists user intent (running/browser_enabled) across restarts
 BYBIT_P2P_URL = "https://www.bybit.com/en/p2p/merchant-admin/backlog"
 FALLBACK_URL  = "https://www.bybit.com/en/p2p/buy/BTC/NGN"
 
@@ -25,6 +26,7 @@ MAX_INTERVAL  = 40 * 60   # 40 minutes
 
 BROWSER_RECYCLE_SECONDS = 12 * 60 * 60   # internal recycle: close & relaunch browser stack every 12h
 RUN_SAFE_MAX_RETRIES    = 3              # how many times run_safe restarts a crashed task
+BROWSER_ENABLED_CHECK_INTERVAL = 30      # how often the recycle-sleep wakes to check for a close request
 
 BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID       = int(os.getenv("TELEGRAM_CHAT_ID"))
@@ -101,6 +103,7 @@ state = {
     "started_at":      None,
     "expiry_alerted":  False,  # prevents alert spam across systemd restarts
     "session_task":    None,   # the currently running keepalive/login task (or None)
+    "browser_alive":   False,  # whether a browser stack is currently launched
 }
 
 # Live references to the current browser stack — read by pause/resume handlers
@@ -112,29 +115,29 @@ browser_ref = {
     "context":    None,
     "page":       None,
 }
+
+# Controls whether browser_manager should have a browser stack up at all.
+# Set  -> browser should be launched/running.
+# Clear -> browser should be fully closed (not just the session task).
+browser_enabled = asyncio.Event()
 # ─────────────────────────────────────────────────────────────────────────────
 
 bot    = Bot(token=BOT_TOKEN)
 router = Router()
 
-# ── KEYBOARD ──────────────────────────────────────────────────────────────────
-KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[
-        [
-            KeyboardButton(text="⏸ Pause"),
-            KeyboardButton(text="▶️ Resume"),
+# ── KEYBOARD (built dynamically from state/memory on every render) ──────────
+def get_keyboard() -> ReplyKeyboardMarkup:
+    pause_label   = "⏸ Pause" if state["running"] else "▶️ Resume"
+    browser_label = "🔴 Close Browser" if state["browser_alive"] else "🟢 Open Browser"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=pause_label)],
+            [KeyboardButton(text=browser_label)],
+            [KeyboardButton(text="📊 Status")],
         ],
-        [
-            KeyboardButton(text="🔵 Open Browser"), # Open browser 
-            KeyboardButton(text="🔴 Close Browser"),
-        ],
-        [
-            KeyboardButton(text="📊 Status"),
-        ],
-    ],
-    resize_keyboard=True,
-    persistent=True,
-)
+        resize_keyboard=True,
+        persistent=True,
+    )
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -143,13 +146,54 @@ def log(msg: str):
     print(f"[{ts}] {msg}")
 
 
+# ── PERSISTED INTENT (survives restarts) ─────────────────────────────────────
+# Only stores the user's last deliberate choice — not live counters like
+# refresh_count or last_refresh, which naturally reset on a fresh process.
+def load_persisted_intent() -> dict:
+    defaults = {"browser_enabled": True, "running": True}
+    if Path(BOT_STATE_FILE).exists():
+        try:
+            with open(BOT_STATE_FILE, "r") as f:
+                saved = json.load(f)
+            defaults.update({k: saved[k] for k in defaults if k in saved})
+        except Exception as e:
+            log(f"[!] Failed to read {BOT_STATE_FILE}, using defaults: {e}")
+    return defaults
+
+
+def save_persisted_intent():
+    try:
+        with open(BOT_STATE_FILE, "w") as f:
+            json.dump({
+                "browser_enabled": browser_enabled.is_set(),
+                "running": state["running"],
+            }, f, indent=4)
+    except Exception as e:
+        log(f"[!] Failed to write {BOT_STATE_FILE}: {e}")
+
+
+def apply_persisted_intent():
+    """Loads bybit_bot_state.json and sets browser_enabled accordingly.
+    Must run before browser_manager starts. The 'running' (pause) intent is
+    applied separately, inside browser_manager, right after a successful
+    login — since there's no session_task to pause/resume until then."""
+    intent = load_persisted_intent()
+    if intent["browser_enabled"]:
+        browser_enabled.set()
+    else:
+        browser_enabled.clear()
+    state["running"] = intent["running"]
+    log(f"[i] Restored last known state -> browser_enabled={intent['browser_enabled']}, running={intent['running']}")
+    return intent
+
+
 
 async def notify(msg: str):
     try:
         await bot.send_message(
             chat_id=CHAT_ID,
             text=msg,
-            reply_markup=KEYBOARD
+            reply_markup=get_keyboard()
         )
     except Exception as e:
         log(f"[Telegram ERROR] {e}")
@@ -249,6 +293,9 @@ async def manual_login(page, context):
     We just wait here until is_logged_in() becomes true, then save cookies.
 
     IMPORTANT: never close this tab manually inside the VNC session.
+
+    Also bails out early if the user requests a browser close mid-wait, so
+    a "Close Browser" tap doesn't get stuck behind a login poll loop.
     """
     if IS_ON_VPS:
         if not state["expiry_alerted"]:
@@ -279,6 +326,9 @@ async def manual_login(page, context):
         waited = 0
 
         while not await is_logged_in(page):
+            if not browser_enabled.is_set():
+                log("[i] Browser close requested during login wait — aborting manual_login.")
+                return
             await asyncio.sleep(POLL_INTERVAL)
             waited += POLL_INTERVAL
 
@@ -357,7 +407,7 @@ async def keepalive_loop(page, context):
                 state["session_alive"] = True
 
 
-# ── BROWSER MANAGER (owns Playwright lifecycle + 12h internal recycle) ───────
+# ── BROWSER MANAGER (owns Playwright lifecycle + 12h internal recycle + remote close/open) ───
 async def launch_browser_stack():
     """Launches a fresh Playwright + browser + context + page, stores refs."""
     playwright = await async_playwright().start()
@@ -427,16 +477,24 @@ async def close_browser_stack():
     browser_ref["browser"]    = None
     browser_ref["context"]    = None
     browser_ref["page"]       = None
+    state["browser_alive"] = False
+    state["running"] = False
 
 
 async def browser_manager():
     """
-    Owns the full Playwright/browser lifecycle. Launches the stack, logs in,
-    starts the keepalive session task, then sleeps until the 12h internal
-    recycle mark — at which point it closes everything and relaunches fresh.
-    This never touches the Telegram bot, which runs as a fully separate task.
+    Owns the full Playwright/browser lifecycle.
+
+    Waits on `browser_enabled` before doing anything. When enabled, launches
+    the stack, logs in, starts the keepalive session task, then sleeps until
+    either the 12h internal recycle mark is hit OR the user clears
+    `browser_enabled` (remote "Close Browser") — whichever comes first. On
+    recycle it relaunches immediately; on a user-requested close it tears
+    everything down and goes back to waiting until "Open Browser" is tapped.
     """
     while True:
+        await browser_enabled.wait()
+
         playwright, browser, context, page = await launch_browser_stack()
 
         has_cookies = await load_cookies(context)
@@ -447,107 +505,121 @@ async def browser_manager():
         if not await is_logged_in(page):
             await manual_login(page, context)
 
+        if not browser_enabled.is_set():
+            # user closed the browser while manual_login was waiting
+            log("[i] Browser close requested during login — tearing down.")
+            await close_browser_stack()
+            continue
+
         if not await is_logged_in(page):
             log("[!] Could not log in. Exiting browser_manager.")
             await send_telegram_raw("❌ Keep-Alive failed to start. Could not log in.")
-            await browser.close()
-            await playwright.stop()
+            await close_browser_stack()
             return
 
-        log("[+] Logged in. Starting keep-alive...")
-        state["running"] = True
-        state["session_task"] = asyncio.create_task(
-            run_safe("KeepAliveLoop", keepalive_loop, page, context)
-        )
+        state["browser_alive"] = True
+        if state["running"]:
+            log("[+] Logged in. Starting keep-alive (restored 'running' state)...")
+            state["session_task"] = asyncio.create_task(
+                run_safe("KeepAliveLoop", keepalive_loop, page, context)
+            )
+        else:
+            log("[+] Logged in, but restored state was PAUSED — leaving session task off.")
+            state["started_at"] = datetime.now()
+            await notify("✅ Bybit browser is up (restored PAUSED state — tap ▶️ Resume to go ONLINE).")
 
-        log(f"[i] Browser stack will recycle in {BROWSER_RECYCLE_SECONDS // 3600}h.")
-        await asyncio.sleep(BROWSER_RECYCLE_SECONDS)
+        log(f"[i] Browser stack will recycle in {BROWSER_RECYCLE_SECONDS // 3600}h (or sooner if closed remotely).")
 
-        log("[~] 12h internal recycle — closing browser stack and relaunching...")
-        await notify("🔄 Internal 12h browser recycle — closing and relaunching Chrome (Telegram bot unaffected).")
+        # Sleep for the recycle window, but wake early + often to check
+        # whether a remote "Close Browser" request came in.
+        elapsed = 0
+        while elapsed < BROWSER_RECYCLE_SECONDS and browser_enabled.is_set():
+            await asyncio.sleep(min(BROWSER_ENABLED_CHECK_INTERVAL, BROWSER_RECYCLE_SECONDS - elapsed))
+            elapsed += BROWSER_ENABLED_CHECK_INTERVAL
+
+        if browser_enabled.is_set():
+            log("[~] 12h internal recycle — closing browser stack and relaunching...")
+            await notify("🔄 Internal 12h browser recycle — closing and relaunching Chrome (Telegram bot unaffected).")
+        else:
+            log("[~] Remote close requested — closing browser stack and standing by.")
+            await notify("🔴 Browser CLOSED remotely.\nYou will appear OFFLINE. Tap 🟢 Open Browser to bring it back up.")
+
         await close_browser_stack()
-        # loop restarts: fresh launch_browser_stack() at top
+        # loop restarts: either relaunches immediately (recycle) or blocks
+        # on browser_enabled.wait() until the user taps "Open Browser".
 
 
 
 # ── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
-@router.message(lambda m: m.text == "⏸ Pause")
-async def cmd_pause(message: Message):
+@router.message(lambda m: m.text in ("⏸ Pause", "▶️ Resume"))
+async def cmd_toggle_pause(message: Message):
     if message.chat.id != CHAT_ID:
         return
 
+    if not state["browser_alive"]:
+        await message.answer(
+            "⚠️ Browser is closed right now — nothing to pause/resume.\nTap 🟢 Open Browser first.",
+            reply_markup=get_keyboard()
+        )
+        return
+
     task = state.get("session_task")
+
     if task and not task.done():
+        # currently running -> pause
         task.cancel()
         state["session_task"] = None
         state["running"] = False
+        save_persisted_intent()
         log("[Telegram] Paused by user — session task cancelled.")
         await message.answer(
             "⏸ Keep-Alive PAUSED.\nYou will appear OFFLINE on P2P.",
-            reply_markup=KEYBOARD
+            reply_markup=get_keyboard()
         )
     else:
-        state["running"] = False
-        log("[Telegram] Pause requested — no active session task to cancel.")
-        await message.answer(
-            "⏸ Already paused (no active session).",
-            reply_markup=KEYBOARD
-        )
-
-
-
-@router.message(lambda m: m.text == "🔴 Close Browser")
-async def cmd_close_browser(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
-
-    await close_browser_stack()
-    await message.answer(
-        "🔴 Browser closed.",
-        reply_markup=KEYBOARD
-    )
-
-
-@router.message(lambda m: m.text == "🔵 Open Browser")
-async def cmd_open_browser(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
-
-    await launch_browser_stack()
-    await message.answer(
-        "🔵 Browser opened.",
-        reply_markup=KEYBOARD
-    )
-
-
-@router.message(lambda m: m.text == "▶️ Resume")
-async def cmd_resume(message: Message):
-    if message.chat.id != CHAT_ID:
-        return
-
-    task = state.get("session_task")
-    if task is None or task.done():
+        # currently paused -> resume
         page    = browser_ref.get("page")
         context = browser_ref.get("context")
         if page is None or context is None:
             await message.answer(
                 "⚠️ Browser isn't ready yet — try again in a moment.",
-                reply_markup=KEYBOARD
+                reply_markup=get_keyboard()
             )
             return
         state["running"] = True
         state["session_task"] = asyncio.create_task(
             run_safe("KeepAliveLoop", keepalive_loop, page, context)
         )
+        save_persisted_intent()
         log("[Telegram] Resumed by user — session task created.")
         await message.answer(
             "▶️ Keep-Alive RESUMED.\nYou will appear ONLINE on next refresh cycle.",
-            reply_markup=KEYBOARD
+            reply_markup=get_keyboard()
+        )
+
+
+@router.message(lambda m: m.text in ("🔴 Close Browser", "🟢 Open Browser"))
+async def cmd_toggle_browser(message: Message):
+    if message.chat.id != CHAT_ID:
+        return
+
+    if state["browser_alive"]:
+        log("[Telegram] Close Browser requested by user.")
+        browser_enabled.clear()
+        state["running"] = False
+        save_persisted_intent()
+        await message.answer(
+            "🔴 Closing browser now... (this also stops the keep-alive completely, not just a pause)",
+            reply_markup=get_keyboard()
         )
     else:
+        log("[Telegram] Open Browser requested by user.")
+        browser_enabled.set()
+        state["running"] = True   # opening the browser implies you want it back online
+        save_persisted_intent()
         await message.answer(
-            "▶️ Already running.",
-            reply_markup=KEYBOARD
+            "🟢 Opening browser... give it a few seconds to launch and log in.",
+            reply_markup=get_keyboard()
         )
 
 
@@ -558,6 +630,7 @@ async def cmd_status(message: Message):
 
     task = state.get("session_task")
     task_alive = bool(task and not task.done())
+    browser_str = "🟢 Open" if state["browser_alive"] else "🔴 Closed"
     running_str = "▶️ Running" if task_alive else "⏸ Paused"
     session_str = "✅ Alive"   if state["session_alive"] else "🔴 DEAD"
     last_str    = (
@@ -571,12 +644,13 @@ async def cmd_status(message: Message):
 
     await message.answer(
         f"📊 Keep-Alive Status\n\n"
+        f"Browser:         {browser_str}\n"
         f"State:           {running_str}\n"
         f"Session:         {session_str}\n"
         f"Last refresh:    {last_str}\n"
         f"Total refreshes: {state['refresh_count']}\n"
         f"Uptime:          {uptime_str}",
-        reply_markup=KEYBOARD
+        reply_markup=get_keyboard()
     )
 
 
@@ -609,6 +683,8 @@ async def main():
     log("  Bybit P2P Keep-Alive")
     log(f"  Mode: {'VPS' if IS_ON_VPS else 'LOCAL'}")
     log("=" * 55)
+
+    apply_persisted_intent()
 
     try:
         await asyncio.gather(
