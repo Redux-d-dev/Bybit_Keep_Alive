@@ -453,8 +453,16 @@ async def launch_browser_stack():
     return playwright, browser, context, page
 
 
-async def close_browser_stack():
-    """Cancels the running session task and tears down the browser stack."""
+async def close_browser_stack(pause_intent: bool = True):
+    """Cancels the running session task and tears down the browser stack.
+
+    pause_intent controls whether this teardown should also flip the user's
+    'running' (pause/resume) intent to False. This should be True for a real
+    user-driven close (or a login failure, where nothing was running anyway),
+    but False for the transparent 12h internal recycle — that relaunch should
+    come back up in whatever running-state the user last chose, not silently
+    paused.
+    """
     task = state.get("session_task")
     if task and not task.done():
         task.cancel()
@@ -482,7 +490,8 @@ async def close_browser_stack():
     browser_ref["context"]    = None
     browser_ref["page"]       = None
     state["browser_alive"] = False
-    state["running"] = False
+    if pause_intent:
+        state["running"] = False
 
 
 async def browser_manager():
@@ -493,8 +502,10 @@ async def browser_manager():
     the stack, logs in, starts the keepalive session task, then sleeps until
     either the 12h internal recycle mark is hit OR the user clears
     `browser_enabled` (remote "Close Browser") — whichever comes first. On
-    recycle it relaunches immediately; on a user-requested close it tears
-    everything down and goes back to waiting until "Open Browser" is tapped.
+    recycle it relaunches immediately (preserving whatever running-state was
+    already in effect); on a user-requested close it tears everything down,
+    marks running=False, and goes back to waiting until "Open Browser" is
+    tapped.
     """
     while True:
         await browser_enabled.wait()
@@ -512,13 +523,13 @@ async def browser_manager():
         if not browser_enabled.is_set():
             # user closed the browser while manual_login was waiting
             log("[i] Browser close requested during login — tearing down.")
-            await close_browser_stack()
+            await close_browser_stack(pause_intent=True)
             continue
 
         if not await is_logged_in(page):
             log("[!] Could not log in. Exiting browser_manager.")
             await send_telegram_raw("❌ Keep-Alive failed to start. Could not log in.")
-            await close_browser_stack()
+            await close_browser_stack(pause_intent=True)
             return
 
         state["browser_alive"] = True
@@ -542,13 +553,17 @@ async def browser_manager():
             elapsed += BROWSER_ENABLED_CHECK_INTERVAL
 
         if browser_enabled.is_set():
+            # Transparent internal recycle — do NOT touch the user's pause
+            # intent. Whatever 'running' was before (True or False) should
+            # still be true right after relaunch.
             log("[~] 12h internal recycle — closing browser stack and relaunching...")
             await notify("🔄 Internal 12h browser recycle — closing and relaunching Chrome (Telegram bot unaffected).")
+            await close_browser_stack(pause_intent=False)
         else:
+            # Real user-requested remote close — this SHOULD end up paused.
             log("[~] Remote close requested — closing browser stack and standing by.")
             await notify("🔴 Browser CLOSED remotely.\nYou will appear OFFLINE. Tap 🟢 Open Browser to bring it back up.")
-
-        await close_browser_stack()
+            await close_browser_stack(pause_intent=True)
         # loop restarts: either relaunches immediately (recycle) or blocks
         # on browser_enabled.wait() until the user taps "Open Browser".
 
@@ -695,7 +710,7 @@ async def main():
         )
     finally:
         log("[+] Shutting down. Closing browser...")
-        await close_browser_stack()
+        await close_browser_stack(pause_intent=True)
         await alert_client.close()
 
 
