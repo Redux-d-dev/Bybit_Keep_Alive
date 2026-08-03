@@ -21,6 +21,7 @@ BOT_STATE_FILE = "bybit_bot_state.json"   # persists user intent (running/browse
 BYBIT_P2P_URL = "https://www.bybit.com/en/p2p/merchant-admin/backlog"
 FALLBACK_URL  = "https://www.bybit.com/en/p2p/buy/BTC/NGN"
 
+
 MIN_INTERVAL  = 25 * 60   # 25 minutes
 MAX_INTERVAL  = 40 * 60   # 40 minutes
 
