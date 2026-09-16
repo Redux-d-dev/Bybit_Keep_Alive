@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -94,6 +95,7 @@ class alert_client:
         if cls._session and not cls._session.closed:
             await cls._session.close()
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 # ── STATE ─────────────────────────────────────────────────────────────────────
 class State:
