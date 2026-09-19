@@ -6,3 +6,4 @@ __pycache__/
 test.py
 ssh-key-2026-05-24 (1).key
 connect_login.py
+.mcpignore

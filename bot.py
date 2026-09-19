@@ -1,14 +1,16 @@
 import asyncio
 import random
 import os
+import io
 import json
 import logging
 import aiohttp
+import qrcode
 from pathlib import Path
 from datetime import datetime
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright 
 from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from dotenv import load_dotenv
 
 
@@ -38,6 +40,31 @@ CHAT_ID       = int(os.getenv("TELEGRAM_CHAT_ID"))
 # difference between a genuine startup (crash/reboot/manual) and a routine
 # scheduled restart — only the former sends a phone call.
 SCHEDULED_RESTART_MARKER = "/tmp/bybit_scheduled_restart"
+
+# ── QR LOGIN ──────────────────────────────────────────────────────────────────
+QR_GENERATE_URL  = "https://www.bybit.com/x-api/v3/public/qrcode/generate"
+QR_STATUS_URL    = "https://www.bybit.com/x-api/v3/public/qrcode/status"
+QR_REFRESH_SECS  = 5 * 60          # regenerate + resend QR every 5 minutes
+QR_POLL_MIN      = 5               # random poll interval min (seconds)
+QR_POLL_MAX      = 10              # random poll interval max (seconds)
+QR_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "en-US,en;q=0.9,en-NG;q=0.8",
+    "content-type": "application/json;charset=UTF-8",
+    "dnt": "1",
+    "guid": "adf175f4-dd04-cd06-c0bf-b96824d7e3a7",
+    "lang": "en",
+    "platform": "pc",
+    "referer": "https://www.bybit.com/en/login?redirect_url=https%3A%2F%2Fwww.bybit.com%2Fen%2F&isHomepage=1",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0"
+    ),
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── ALERT GATEWAY (phone call trigger) ──────────────────────────────────────
@@ -302,7 +329,150 @@ async def is_logged_in(page) -> bool:
         return False
 
 
-# ── MANUAL LOGIN ──────────────────────────────────────────────────────────────
+# ── QR LOGIN ─────────────────────────────────────────────────────────────────
+async def qr_login(context) -> bool:
+    """
+    Generates a Bybit QR code, sends it to Telegram, polls for scan.
+    Refreshes the QR every 5 minutes automatically if not yet scanned.
+    On confirmed scan (code=200), injects auth cookies into Playwright context.
+    Returns True on success, False if browser_enabled was cleared mid-wait.
+    """
+    log("[QR] Starting QR login flow...")
+    await notify(
+        "🔐 Bybit session expired.\n"
+        "Generating QR code — scan with your Bybit app to log back in."
+    )
+    await alert_client.trigger_call(
+        source="bybit-keepalive",
+        error_signature="session_expired",
+        message="Bybit P2P session expired. QR code sent to Telegram for re-login.",
+        severity="critical",
+    )
+
+    async def _generate_and_send(session: aiohttp.ClientSession, prev_message_id: int | None = None) -> tuple[str, int | None]:
+        """Generate a fresh QR, send to Telegram, return (uuid, message_id)."""
+        async with session.get(QR_GENERATE_URL, headers=QR_HEADERS) as resp:
+            data = await resp.json()
+            if data.get("ret_code") != 0:
+                raise RuntimeError(f"QR generate failed: {data}")
+        result       = data["result"]
+        uuid         = result["uuid"]
+        code_content = result["codeContent"]
+
+        # Build QR image in memory
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
+        qr.add_data(code_content)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+
+        # Mark previous QR as expired before sending new one
+        if prev_message_id:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=CHAT_ID,
+                    message_id=prev_message_id,
+                    caption="⌛ QR Expired — do not scan this. A fresh one is on its way...",
+                )
+            except Exception as e:
+                log(f"[QR] Could not mark previous QR as expired: {e}")
+
+        # Send to Telegram as photo
+        message_id = None
+        try:
+            sent = await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=BufferedInputFile(buf.read(), filename="bybit_qr.png"),
+                caption="📱 Scan this QR with your Bybit app to restore the session.\nExpires in 5 minutes — a new one will be sent automatically.",
+                reply_markup=get_keyboard(),
+            )
+            message_id = sent.message_id
+            log("[QR] QR code sent to Telegram.")
+        except Exception as e:
+            log(f"[QR] Failed to send QR to Telegram: {e}")
+
+        return uuid, message_id
+
+    async with aiohttp.ClientSession() as session:
+        uuid, message_id = await _generate_and_send(session)
+        elapsed          = 0
+        last_code        = None
+
+        while True:
+            # Check if browser was closed mid-wait
+            if not Events.browser_enabled.is_set():
+                log("[QR] Browser close requested during QR login — aborting.")
+                return False
+
+            # Refresh QR every 5 minutes
+            if elapsed >= QR_REFRESH_SECS:
+                log("[QR] QR expired — regenerating and resending...")
+                uuid, message_id = await _generate_and_send(session, prev_message_id=message_id)
+                elapsed = 0
+
+            # Poll status
+            poll_interval = random.randint(QR_POLL_MIN, QR_POLL_MAX)
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            async with session.get(f"{QR_STATUS_URL}?uuid={uuid}", headers=QR_HEADERS) as resp:
+                data   = await resp.json()
+                result = data.get("result", {})
+                code   = result.get("code")
+
+                if code != last_code:
+                    log(f"[QR] Status: {last_code} → {code}")
+                    last_code = code
+
+                if code == "200":
+                    log("[QR] ✅ Scan confirmed! Injecting cookies...")
+
+                    # Mark QR as used
+                    if message_id:
+                        try:
+                            await bot.edit_message_caption(
+                                chat_id=CHAT_ID,
+                                message_id=message_id,
+                                caption="✅ QR scanned successfully — session restored.",
+                            )
+                        except Exception:
+                            pass
+
+                    # Extract auth data
+                    token        = result.get("userToken", "")
+                    secure_token = None
+                    for cookie in session.cookie_jar:
+                        if cookie.key == "secure-token":
+                            secure_token = cookie.value
+                    # Fallback to Token response header
+                    if not secure_token:
+                        secure_token = dict(resp.headers).get("Token", token)
+
+                    # Inject into Playwright context
+                    await context.add_cookies([
+                        {"name": "isLogin",      "value": "1",          "domain": ".bybit.com", "path": "/"},
+                        {"name": "secure-token", "value": secure_token, "domain": ".bybit.com", "path": "/"},
+                        {"name": "token",        "value": token,        "domain": ".bybit.com", "path": "/"},
+                    ])
+                    log("[QR] Cookies injected into Playwright context.")
+
+                    # Navigate to target page and confirm login before saving
+                    page = browser_ref.get("page")
+                    if page:
+                        await page.goto(BYBIT_P2P_URL, wait_until="domcontentloaded")
+                        await asyncio.sleep(4)
+                        if await is_logged_in(page):
+                            await save_cookies(context)
+                            await notify("✅ QR scan confirmed. Session restored — resuming keep-alive.")
+                            log("[QR] Session saved and confirmed on P2P page.")
+                        else:
+                            log("[QR] ⚠️ Cookies injected but login not confirmed on P2P page.")
+                    return True
+
+
+# ── MANUAL LOGIN (dead code — kept for reference) ─────────────────────────────
 async def manual_login(page, context):
     """
     On VPS: login happens LIVE, in this same browser, via noVNC/VNC.
@@ -422,8 +592,8 @@ async def keepalive_loop(page, context):
                 log("[✓] Session recovered via cookie reload.")
             else:
                 State.session_alive = False
-                log("[!] Session DEAD. Entering live re-login wait...")
-                await manual_login(page, context)
+                log("[!] Session DEAD. Starting QR re-login...")
+                await qr_login(context)
                 State.session_alive = True
 
 
@@ -548,10 +718,14 @@ async def browser_manager():
             await asyncio.sleep(4)
 
         if not await is_logged_in(page):
-            await manual_login(page, context)
+            success = await qr_login(context)
+            if not success:
+                log("[i] Browser close requested during QR login — tearing down.")
+                await close_browser_stack(pause_intent=True)
+                continue
 
         if not Events.browser_enabled.is_set():
-            # user closed the browser while manual_login was waiting
+            # user closed the browser while login was waiting
             log("[i] Browser close requested during login — tearing down.")
             await close_browser_stack(pause_intent=True)
             continue
